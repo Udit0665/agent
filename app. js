@@ -1,0 +1,220 @@
+// Jarvis web UI. A remote control + transcript only.
+// Voice listening runs in the Termux daemon, so closing this page stops nothing.
+
+// --- CONNECT TO YOUR PHONE ---
+const API_BASE = "https://rio-raising-consequence-measurement.trycloudflare.com";
+
+const $ = (s) => document.querySelector(s);
+const logEl = $("#log"), emptyEl = $("#empty"), input = $("#text-input");
+const micBtn = $("#mic-btn");
+
+const COPY = {
+  idle:     ["Listening", () => `Say “${wake}” and then your command.`],
+  hearing:  ["Hearing you", () => "Keep going…"],
+  thinking: ["Thinking", () => "Working on it."],
+  speaking: ["Speaking", () => "Mic is paused while I talk."],
+  muted:    ["Mic off", () => "Tap the mic to turn listening back on."],
+  error:    ["Needs attention", () => detail || "Check the Termux log."],
+  offline:  ["Offline", () => "Start the server in Termux: bash start.sh"],
+};
+let wake = "Jarvis", detail = "", state = "offline", lastId = 0, online = false;
+
+// ---------- API ----------
+async function api(path, body) {
+  const opts = body === undefined ? {} : {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  };
+  // Changed to use API_BASE
+  const res = await fetch(API_BASE + path, opts);
+  if (!res.ok) throw new Error(res.status);
+  return res.json();
+}
+
+// ---------- state ----------
+function setState(next) {
+  state = next;
+  document.body.dataset.state = next;
+  const [label, hint] = COPY[next] || COPY.offline;
+  $("#state-label").textContent = label;
+  $("#state-hint").textContent = hint();
+  orb.target = ENERGY[next] ?? 0.2;
+}
+
+async function pollState() {
+  try {
+    const s = await api("/api/state");
+    online = true;
+    wake = s.wake ? s.wake[0].toUpperCase() + s.wake.slice(1) : wake;
+    detail = s.detail || "";
+    $("#subtitle").textContent = s.session_active ? "Awake. No wake word needed right now." : `Running in background · voice ${s.stt || 'android'}`;
+    
+    const b = $("#stat-battery");
+    b.textContent = s.battery == null ? "--%" : `${s.battery}%${s.charging ? " ⚡" : ""}`;
+    const w = $("#stat-wifi");
+    w.textContent = s.wifi ? s.wifi.replace(/"/g, "") : "no wifi";
+    w.classList.toggle("on", !!s.wifi);
+    const l = $("#stat-llm");
+    l.textContent = s.llm ? "LLM on" : "LLM off";
+    l.classList.toggle("on", s.llm);
+    micBtn.setAttribute("aria-pressed", String(!s.muted));
+    setState(s.state || "idle");
+  } catch {
+    online = false;
+    $("#subtitle").textContent = "Connected to Tunnel. Waiting for Termux...";
+    setState("idle"); // Keep it idle so user can type even if state fails
+  }
+}
+
+// ---------- transcript ----------
+function fmt(ts) {
+  return new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+function render(ev) {
+  emptyEl.hidden = true;
+  const row = document.createElement("div");
+  row.className = `msg ${ev.kind}`;
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  bubble.textContent = ev.text;
+  if (ev.photo_url) {
+    const a = document.createElement("a");
+    a.href = ev.photo_url; a.target = "_blank"; a.rel = "noopener";
+    const img = document.createElement("img");
+    img.src = ev.photo_url; img.className = "shot"; img.alt = "Captured photo";
+    a.appendChild(img); bubble.appendChild(a);
+  }
+  const t = document.createElement("time");
+  t.textContent = fmt(ev.ts);
+  row.append(bubble, t);
+  const nearBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 80;
+  logEl.appendChild(row);
+  if (nearBottom) logEl.scrollTop = logEl.scrollHeight;
+}
+async function pollEvents() {
+  try {
+    const d = await api(`/api/events?since=${lastId}`);
+    if(d.events) {
+        d.events.forEach((e) => { render(e); lastId = Math.max(lastId, e.id); });
+    }
+  } catch { /* offline handled by pollState */ }
+}
+
+// ---------- actions ----------
+async function send(text) {
+  text = text.trim();
+  if (!text) return;
+  input.value = "";
+  
+  // Add user message to UI instantly
+  render({ kind: "user", text: text, ts: Date.now() / 1000 });
+  
+  try { 
+    const res = await api("/api/chat", { message: text, speak: true }); 
+    // Add bot reply to UI
+    if (res && res.reply) {
+        render({ kind: "bot", text: res.reply, ts: Date.now() / 1000 });
+    }
+  } catch (e) { 
+    render({ kind: "system", text: "Error connecting to phone server.", ts: Date.now() / 1000 });
+  }
+}
+$("#composer").addEventListener("submit", (e) => { e.preventDefault(); send(input.value); });
+$("#quick").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-cmd]");
+  if (b) send(b.dataset.cmd);
+});
+micBtn.addEventListener("click", async () => {
+  const enable = micBtn.getAttribute("aria-pressed") !== "true";
+  try { await api("/api/listen", { enabled: enable }); } catch { /* ignore */ }
+  pollState(); pollEvents();
+});
+$("#wake-btn").addEventListener("click", async () => {
+  try { await api("/api/wake", {}); } catch { /* ignore */ }
+  pollState();
+});
+
+// ---------- orb ----------
+const ENERGY = { idle: 0.22, hearing: 0.85, thinking: 0.55, speaking: 0.95, muted: 0.04, error: 0.1, offline: 0.08 };
+const orb = { energy: 0.1, target: 0.1 };
+const cv = $("#orb"), ctx = cv.getContext("2d");
+const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+function fit() {
+  const dpr = Math.min(devicePixelRatio || 1, 2), r = cv.getBoundingClientRect();
+  cv.width = Math.round(r.width * dpr); cv.height = Math.round(r.height * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+function rgba(hex, a) {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${n >> 16 & 255},${n >> 8 & 255},${n & 255},${a})`;
+}
+function accent() {
+  const v = getComputedStyle(document.body).getPropertyValue("--accent").trim();
+  return /^#[0-9a-f]{6}$/i.test(v) ? v : "#35e0ff";
+}
+function frame(ms) {
+  const t = ms / 1000, size = cv.getBoundingClientRect().width;
+  if (!size) return requestAnimationFrame(frame);
+  orb.energy += (orb.target - orb.energy) * 0.06;
+  const e = orb.energy, c = accent(), cx = size / 2, R = size * 0.34;
+  ctx.clearRect(0, 0, size, size);
+
+  const breathe = 1 + Math.sin(t * (1.2 + e * 3)) * (0.04 + e * 0.07);
+  const g = ctx.createRadialGradient(cx, cx, 0, cx, cx, R * 1.7 * breathe);
+  g.addColorStop(0, rgba(c, 0.5 * (0.35 + e)));
+  g.addColorStop(0.45, rgba(c, 0.12 + e * 0.1));
+  g.addColorStop(1, rgba(c, 0));
+  ctx.fillStyle = g; ctx.fillRect(0, 0, size, size);
+
+  ctx.save(); ctx.translate(cx, cx); ctx.rotate(t * 0.08 * (1 + e * 2));
+  for (let i = 0; i < 72; i++) {
+    const a = (i / 72) * Math.PI * 2, long = i % 6 === 0;
+    ctx.strokeStyle = rgba(c, long ? 0.7 : 0.28); ctx.lineWidth = long ? 1.6 : 1;
+    ctx.beginPath();
+    ctx.moveTo(Math.cos(a) * R * 1.46, Math.sin(a) * R * 1.46);
+    ctx.lineTo(Math.cos(a) * R * (long ? 1.34 : 1.4), Math.sin(a) * R * (long ? 1.34 : 1.4));
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  [[1.22, 0.35, 90, 1.5], [1.08, -0.6, 140, 1.2], [0.94, 0.9, 60, 1]].forEach(([k, sp, dash, w], i) => {
+    ctx.save(); ctx.translate(cx, cx); ctx.rotate(t * sp * (0.5 + e * 2.4));
+    ctx.strokeStyle = rgba(c, 0.5 - i * 0.1); ctx.lineWidth = w;
+    ctx.setLineDash([dash * 0.4, dash * 0.25, dash * 0.1, dash * 0.25]);
+    ctx.beginPath(); ctx.arc(0, 0, R * k, 0, Math.PI * 2); ctx.stroke();
+    ctx.restore();
+  });
+  ctx.setLineDash([]);
+
+  const amp = R * (0.015 + e * 0.11), spd = 1.4 + e * 4;
+  ctx.beginPath();
+  for (let i = 0; i <= 120; i++) {
+    const a = (i / 120) * Math.PI * 2;
+    const r = R * 0.8 + Math.sin(a * 5 + t * spd) * amp + Math.sin(a * 9 - t * spd * 1.3) * amp * 0.55;
+    const x = cx + Math.cos(a) * r, y = cx + Math.sin(a) * r;
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  }
+  ctx.closePath(); ctx.strokeStyle = rgba(c, 0.95); ctx.lineWidth = 2; ctx.shadowColor = c; ctx.shadowBlur = 14; ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  const core = R * (0.36 + Math.sin(t * (2 + e * 5)) * 0.015 * (1 + e * 3));
+  const cg = ctx.createRadialGradient(cx, cx, 0, cx, cx, core);
+  cg.addColorStop(0, "#ffffff"); cg.addColorStop(0.35, rgba(c, 0.95)); cg.addColorStop(1, rgba(c, 0.05));
+  ctx.fillStyle = cg; ctx.beginPath(); ctx.arc(cx, cx, core, 0, Math.PI * 2); ctx.fill();
+
+  if (!reduce) requestAnimationFrame(frame);
+}
+
+// ---------- boot ----------
+addEventListener("resize", fit);
+fit(); setState("offline");
+if (reduce) { frame(0); setInterval(() => frame(0), 600); } else requestAnimationFrame(frame);
+
+let timers = [];
+function start() {
+  stop(); pollState(); pollEvents();
+  timers = [setInterval(pollEvents, 1000), setInterval(pollState, 2500)];
+}
+function stop() { timers.forEach(clearInterval); timers = []; }
+document.addEventListener("visibilitychange", () => (document.hidden ? stop() : start()));
+start();
