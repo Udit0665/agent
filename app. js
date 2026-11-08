@@ -1,8 +1,7 @@
 // Jarvis web UI. A remote control + transcript only.
 // Voice listening runs in the Termux daemon, so closing this page stops nothing.
 
-// --- CONNECT TO YOUR PHONE ---
-const API_BASE = "https://rio-raising-consequence-measurement.trycloudflare.com";
+// const API_BASE = "https://a909db68fd6596.lhr.life";
 
 const $ = (s) => document.querySelector(s);
 const logEl = $("#log"), emptyEl = $("#empty"), input = $("#text-input");
