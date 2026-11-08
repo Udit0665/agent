@@ -1,7 +1,7 @@
 // Jarvis web UI. A remote control + transcript only.
 // Voice listening runs in the Termux daemon, so closing this page stops nothing.
 
-const API_BASE = "https://a909db68fd6596.lhr.life";
+const API_BASE = "https://b01b4209a7258d.lhr.life";
 
 const $ = (s) => document.querySelector(s);
 const logEl = $("#log"), emptyEl = $("#empty"), input = $("#text-input");
